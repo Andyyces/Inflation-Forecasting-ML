@@ -1,52 +1,59 @@
 # =============================================================================
-# 01_ucsv.R  [FIXED - numerical stability + correct yoy scaling]
+# 01_ucsv.R
 # UCSV Model: Estimation and Recursive Forecasting
 # Translation of Chan (2018), Econometric Reviews, 37(8), 807-823
 # Non-centred parameterisation of Stock & Watson (2007)
 # As used in Banbura & Bobeica (2023)
+#
+# EVALUATION NOTE:
+#   - Models are estimated on pi_core_mom (m/m annualised, x1200)
+#   - Forecasts are path-averages of simulated m/m annualised paths
+#   - Evaluation uses the h-period average of realised m/m annualised,
+#     which is the natural target consistent with the path-average formula
+#   - This is consistent across all horizons h=1,2,3,4,5,6,12
 # =============================================================================
 
-library(here)
-library(readxl)
-library(dplyr)
-library(lubridate)
+Sys.setlocale("LC_TIME", "English")
+library(pacman)
+p_load(here,
+       readxl,
+       dplyr,
+       lubridate)
 
 # =============================================================================
 # SECTION 1: LOAD AND PREPARE DATA
 # =============================================================================
 
-panel <- read_excel(here("Data", "EA-MD-QD", "EA-MD-QD-2026-02",
-                         "data_TR2", "eadataM_NA_TR2.xlsx"))
+panel_a <- readRDS(here("Data", "panel_a.rds"))
 raw   <- read_excel(here("Data", "EA-MD-QD", "EA-MD-QD-2026-02", "EAdata.xlsx"),
                     sheet = "data")
 
-panel <- panel %>% mutate(Time = as.Date(Time))
 raw   <- raw   %>% mutate(Time = as.Date(Time))
 
 start_date <- as.Date("2000-01-01")
-panel <- panel %>% filter(Time >= start_date)
 raw   <- raw   %>% filter(Time >= start_date)
 
-dates  <- panel$Time
-T_full <- nrow(panel)
+dates  <- panel_a$Time
+T_full <- nrow(panel_a)
 
-cat("Panel dimensions:", T_full, "x", ncol(panel) - 1, "\n")
+cat("Panel dimensions:", T_full, "x", ncol(panel_a) - 1, "\n")
 cat("Date range:", format(min(dates)), "to", format(max(dates)), "\n")
+
+saveRDS(raw, here("Data", "raw.rds"))
 
 # --- Construct inflation series from raw HICP levels ---
 core_level     <- as.numeric(raw$HICPNEF_EA)
 headline_level <- as.numeric(raw$HICPOV_EA)
 
-# Month-on-month annualised x1200: INPUT to all models (UCSV, DFM, ML)
+# Month-on-month annualised (x1200): input to all models
 pi_core_mom <- c(NA, 1200 * diff(log(core_level)))
 pi_hl_mom   <- c(NA, 1200 * diff(log(headline_level)))
 
-# Year-on-year x100: EVALUATION TARGET for RMSE tables
-# Note: x100 only, NOT x1200 -- yoy diff already covers 12 months
+# Year-on-year (x100): for reference and robustness plots only
 pi_core_yoy <- c(rep(NA, 12), 100 * diff(log(core_level),     lag = 12))
 pi_hl_yoy   <- c(rep(NA, 12), 100 * diff(log(headline_level), lag = 12))
 
-# Sanity check: recent values should be ~1-3% for core HICP
+# Sanity check
 cat("\nRecent core HICP (m/m annualised and y/y):\n")
 print(tail(data.frame(date = dates,
                       mom  = round(pi_core_mom, 2),
@@ -71,7 +78,7 @@ svrw_gam <- function(Ystar, htilde, h0, omegah, b0, Vh0, Vh, Vomegah) {
   sigj     <- c(5.79596, 2.61369, 5.17950, 0.16735, 0.64009, 0.34023, 1.26261)
   sqrtsigj <- sqrt(sigj)
 
-  # --- Step 1: Sample mixture component S ---
+  # Step 1: Sample mixture component S
   fitted <- h0 + omegah * htilde
   q_mat  <- matrix(NA, T, 7)
   for (j in 1:7) {
@@ -86,7 +93,7 @@ svrw_gam <- function(Ystar, htilde, h0, omegah, b0, Vh0, Vh, Vomegah) {
   S        <- rowSums(cumq < temprand) + 1L
   S        <- pmin(pmax(S, 1L), 7L)
 
-  # --- Step 2: Sample htilde ---
+  # Step 2: Sample htilde
   dconst   <- mj[S]
   invOmega <- 1 / sigj[S]
 
@@ -113,7 +120,7 @@ svrw_gam <- function(Ystar, htilde, h0, omegah, b0, Vh0, Vh, Vomegah) {
     htildehat + backsolve(Kh_chol, rnorm(T))
   }, error = function(e) htilde)
 
-  # --- Step 3: Sample h0 and omegah jointly ---
+  # Step 3: Sample h0 and omegah jointly
   Xbeta      <- cbind(1, htilde_draw)
   invVbeta   <- diag(c(1/Vh0, 1/Vomegah))
   XtinvOmega <- t(Xbeta) * invOmega
@@ -147,14 +154,11 @@ svrw_gam <- function(Ystar, htilde, h0, omegah, b0, Vh0, Vh, Vomegah) {
   htilde_out <- U * htilde_draw
   omegah_out <- U * omegah_new
 
-  omegahhat <- betahat[2]
-  Domegah   <- Dbeta[2, 2]
-
   return(list(htilde    = as.numeric(htilde_out),
               h0        = as.numeric(h0_new),
               omegah    = as.numeric(omegah_out),
-              omegahhat = as.numeric(omegahhat),
-              Domegah   = as.numeric(Domegah)))
+              omegahhat = as.numeric(betahat[2]),
+              Domegah   = as.numeric(Dbeta[2, 2])))
 }
 
 
@@ -195,7 +199,7 @@ ucsv_gam <- function(y, nloop = 11000, burnin = 1000, verbose = FALSE) {
 
   for (loop in 1:nloop) {
 
-    # === Block 1: Sample tau ===
+    # Block 1: Sample tau
     exp_neg_h <- exp(-h)
     exp_neg_g <- exp(-g)
 
@@ -208,15 +212,13 @@ ucsv_gam <- function(y, nloop = 11000, burnin = 1000, verbose = FALSE) {
     invDtau_off  <- HtinvStauH_off
 
     HtinvStauH_x_tau0    <- numeric(T)
-    HtinvStauH_x_tau0[1] <- HtinvStauH_main[1] * tau0 +
-                              HtinvStauH_off[1]  * tau0
+    HtinvStauH_x_tau0[1] <- HtinvStauH_main[1] * tau0 + HtinvStauH_off[1]  * tau0
     for (t in 2:(T - 1)) {
       HtinvStauH_x_tau0[t] <- HtinvStauH_off[t-1] * tau0 +
                                 HtinvStauH_main[t]  * tau0 +
                                 HtinvStauH_off[t]   * tau0
     }
-    HtinvStauH_x_tau0[T] <- HtinvStauH_off[T-1] * tau0 +
-                              HtinvStauH_main[T]  * tau0
+    HtinvStauH_x_tau0[T] <- HtinvStauH_off[T-1] * tau0 + HtinvStauH_main[T] * tau0
 
     rhs_tau <- HtinvStauH_x_tau0 + y * exp_neg_h
 
@@ -232,7 +234,7 @@ ucsv_gam <- function(y, nloop = 11000, burnin = 1000, verbose = FALSE) {
       tauhat + backsolve(chol_invDtau, rnorm(T))
     }, error = function(e) tau)
 
-    # === Block 2: Sample htilde (SV on transitory residuals) ===
+    # Block 2: Sample htilde (SV on transitory residuals)
     eps_pi  <- y - tau
     Ystar_h <- log(eps_pi^2 + 1e-4)
 
@@ -242,7 +244,7 @@ ucsv_gam <- function(y, nloop = 11000, burnin = 1000, verbose = FALSE) {
     omegah <- res_h$omegah
     h      <- h0 + omegah * htilde
 
-    # === Block 3: Sample gtilde (SV on trend innovations) ===
+    # Block 3: Sample gtilde (SV on trend innovations)
     eps_tau <- c((tau[1] - tau0) / sqrt(Vtau), diff(tau))
     Ystar_g <- log(eps_tau^2 + 1e-4)
 
@@ -276,10 +278,9 @@ ucsv_gam <- function(y, nloop = 11000, burnin = 1000, verbose = FALSE) {
 
 
 # -----------------------------------------------------------------------------
-# ucsv_forecast(): Forward simulation to generate forecasts
+# ucsv_forecast(): Forward simulation
 # Path-average formula from Banbura & Bobeica (2023)
-# Output is in same units as input (m/m annualised, x1200)
-# RMSE evaluation converts to y/y using x100 series
+# Output units: same as input (m/m annualised, x1200)
 # -----------------------------------------------------------------------------
 ucsv_forecast <- function(mcmc_output, h_max = 12, n_sim = 1000) {
 
@@ -314,9 +315,7 @@ ucsv_forecast <- function(mcmc_output, h_max = 12, n_sim = 1000) {
     pi_paths[i, ] <- pi_sim
   }
 
-  # Path-average point forecasts (m/m annualised units, x1200)
-  # For h=12: this approximates the year-on-year rate / 12 * 12 = yoy
-  # when compared against pi_core_yoy (x100), scale by 1/12
+  # Path-average: median over draws of (1/h * sum pi_{t+1:t+h})
   forecasts        <- numeric(h_max)
   names(forecasts) <- paste0("h", 1:h_max)
 
@@ -334,15 +333,14 @@ ucsv_forecast <- function(mcmc_output, h_max = 12, n_sim = 1000) {
 # SECTION 3: RECURSIVE FORECASTING LOOP
 # =============================================================================
 
-horizons <- c(1,2,3,4,5,6,12)
+horizons   <- c(1, 2, 3, 4, 5, 6, 12)
 h_max      <- max(horizons)
 nloop      <- 11000
 burnin     <- 1000
 n_sim      <- 1000
 
-# Change n_origins to 3 for a test run, then set back to full for production
 eval_start <- which(dates == as.Date("2010-01-01"))
-n_origins  <- T_full - eval_start + 1 - h_max   # full run (~182)
+n_origins  <- T_full - eval_start + 1 - h_max   # full run
 # n_origins <- 3                                 # test run
 
 cat("\nRecursive forecasting setup:\n")
@@ -363,8 +361,6 @@ start_time <- Sys.time()
 for (i in 1:n_origins) {
 
   t_now <- eval_start - 1 + i
-
-  # Expanding window: all data up to forecast origin, drop leading NA
   y_est <- pi_core_mom[1:t_now]
   y_est <- y_est[!is.na(y_est)]
 
@@ -375,152 +371,201 @@ for (i in 1:n_origins) {
   mcmc_out <- ucsv_gam(y_est, nloop = nloop, burnin = burnin, verbose = FALSE)
   fc_out   <- ucsv_forecast(mcmc_out, h_max = h_max, n_sim = n_sim)
 
-  fc_ucsv[i, ] <- fc_out$forecasts[horizons]
+  fc_ucsv[i, ] <- fc_out$forecasts[paste0("h", horizons)]
 }
 
 elapsed <- difftime(Sys.time(), start_time, units = "mins")
 cat("\nRecursive loop completed in", round(elapsed, 1), "minutes\n")
 
 # =============================================================================
-# SECTION 4: CONVERT FORECASTS TO y/y SCALE FOR EVALUATION
-# =============================================================================
-# UCSV forecasts are in m/m annualised (x1200) units
-# Path-average at h=12 approximates the year-on-year rate
-# But x1200 vs x100 means we need to divide by 12 for comparison
-# Alternatively: scale the forecast to match evaluation units
-
-# Convert path-average m/m annualised to y/y percentage points
-# path_avg_mom (x1200) / 12 * 12 months = cumulative, but path average
-# already averages over h months, so:
-# E[sum_{j=1}^{12} pi_{t+j}^{mom}] / 12 * 12 = sum = approx yoy in x1200 units
-# To get x100 units: divide by 12
-fc_ucsv_yoy        <- fc_ucsv / 12
-colnames(fc_ucsv_yoy) <- paste0("h", horizons, "_yoy")
-
-# =============================================================================
-# SECTION 5: SAVE OUTPUT
+# SECTION 4: SAVE OUTPUT
 # =============================================================================
 
 dir.create(here("Output", "Forecasts"), recursive = TRUE, showWarnings = FALSE)
-
-# Save raw forecasts (m/m annualised, x1200) -- use for model comparison
-saveRDS(fc_ucsv,     here("Output", "Forecasts", "fc_ucsv_core_mom.rds"))
-write.csv(fc_ucsv,   here("Output", "Forecasts", "fc_ucsv_core_mom.csv"))
-
-# Save y/y scaled forecasts -- use for RMSE tables against pi_core_yoy
-saveRDS(fc_ucsv_yoy, here("Output", "Forecasts", "fc_ucsv_core_yoy.rds"))
-write.csv(fc_ucsv_yoy, here("Output", "Forecasts", "fc_ucsv_core_yoy.csv"))
-
-cat("\nForecasts saved.\n")
-cat("\nPreview (m/m annualised):\n"); print(head(fc_ucsv))
-cat("\nPreview (y/y):\n");            print(head(fc_ucsv_yoy))
-
-# =============================================================================
-# SECTION 6: DIAGNOSTIC PLOT
-# =============================================================================
-
-fc_dates   <- dates[eval_start:(eval_start + n_origins - 1)]
-
-# Realised y/y values 12 months after each forecast origin
-target_idx <- (eval_start + 12 - 1):(eval_start + n_origins + 12 - 2)
-realised   <- pi_core_yoy[target_idx]
-
-# Compare y/y scaled forecasts against realised y/y
-errors_h12 <- fc_ucsv_yoy[, "h12_yoy"] - realised
-rmse_h12   <- sqrt(mean(errors_h12^2, na.rm = TRUE))
-cat("\nRMSE at h=12 (y/y %):", round(rmse_h12, 4), "\n")
-
-# Reload and inspect
-fc <- readRDS(here("Output", "Forecasts", "fc_ucsv_core.rds"))
-
-# Save the correct full results
 saveRDS(fc_ucsv, here("Output", "Forecasts", "fc_ucsv_core.rds"))
 write.csv(fc_ucsv, here("Output", "Forecasts", "fc_ucsv_core.csv"))
-cat("Full results saved:", nrow(fc_ucsv), "origins\n")
-Sys.setlocale("LC_TIME", "English")
-
-fc_dates_full   <- dates[eval_start:(eval_start + nrow(fc_ucsv) - 1)]
-target_idx_full <- (eval_start + 12 - 1):(eval_start + nrow(fc_ucsv) + 12 - 2)
-realised_full   <- pi_core_yoy[target_idx_full]
-
-plot(fc_dates_full, fc_ucsv[, "h12"],
-     type = "l", col = "blue", lwd = 1.5,
-     ylim = range(c(fc_ucsv[, "h12"], realised_full), na.rm = TRUE),
-     main = "UCSV: h=12 forecasts vs realised core HICP (y/y %)",
-     ylab = "% (year-on-year)", xlab = "")
-lines(fc_dates_full, realised_full, col = "black", lwd = 1.5)
-legend("topleft", legend = c("UCSV forecast", "Realised"),
-       col = c("blue", "black"), lty = 1, bty = "n")
-
-
-rmse_h1  <- sqrt(mean((fc_ucsv[,"h1"]  - pi_core_yoy[eval_start:(eval_start + nrow(fc_ucsv) - 1)])^2, na.rm = TRUE))
-rmse_h3  <- sqrt(mean((fc_ucsv[,"h3"]  - pi_core_yoy[(eval_start+2):(eval_start + nrow(fc_ucsv) + 1)])^2, na.rm = TRUE))
-rmse_h12 <- sqrt(mean((fc_ucsv[,"h12"] - realised_full)^2, na.rm = TRUE))
-
-cat("UCSV RMSE:\n")
-cat("h=1: ", round(rmse_h1, 4), "\n")
-cat("h=3: ", round(rmse_h3, 4), "\n")
-cat("h=12:", round(rmse_h12, 4), "\n")
-
+cat("Saved:", nrow(fc_ucsv), "origins x", ncol(fc_ucsv), "horizons\n")
 
 # =============================================================================
-# Random Walk benchmark
-# Forecast at all horizons = current y/y inflation (last observed value)
+# SECTION 5: RANDOM WALK BENCHMARKS
 # =============================================================================
+# RW2: forecast = 3-month trailing average of m/m annualised
+# RW3: forecast = 12-month trailing average of m/m annualised (~current y/y)
 
-fc_rw <- matrix(NA, nrow(fc_ucsv), 3,
-                dimnames = list(rownames(fc_ucsv), c("h1", "h3", "h12")))
-
-for (i in 1:nrow(fc_ucsv)) {
-  t_now <- eval_start - 1 + i
-  # RW forecast: last observed y/y value, same for all horizons
-  fc_rw[i, ] <- rep(pi_core_yoy[t_now], 3)
+make_rw_matrix <- function(n_origins, horizons, dates, eval_start) {
+  matrix(NA, n_origins, length(horizons),
+         dimnames = list(
+           format(dates[eval_start:(eval_start + n_origins - 1)]),
+           paste0("h", horizons)
+         ))
 }
 
-# Correct evaluation: forecast made at t, evaluated against realised at t+h
-# For h=1: forecast at t, realised at t+1
-# For h=3: forecast at t, realised at t+3  
-# For h=12: forecast at t, realised at t+12
+fc_rw2 <- make_rw_matrix(n_origins, horizons, dates, eval_start)
+fc_rw3 <- make_rw_matrix(n_origins, horizons, dates, eval_start)
 
-n_fc <- nrow(fc_ucsv)
+for (i in 1:n_origins) {
+  t_now <- eval_start - 1 + i
 
-# Realised values shifted by h periods
-realised_h1  <- pi_core_yoy[(eval_start + 1):(eval_start + n_fc)]
-realised_h3  <- pi_core_yoy[(eval_start + 3):(eval_start + n_fc + 2)]
-realised_h12 <- pi_core_yoy[(eval_start + 12):(eval_start + n_fc + 11)]
+  idx3         <- max(1, t_now - 2)
+  fc_rw2[i, ] <- rep(mean(pi_core_mom[idx3:t_now],  na.rm = TRUE), length(horizons))
 
-# RW RMSE
-cat("Random Walk RMSE:\n")
-cat("h=1: ",  round(sqrt(mean((fc_rw[,"h1"]  - realised_h1)^2,  na.rm=TRUE)), 4), "\n")
-cat("h=3: ",  round(sqrt(mean((fc_rw[,"h3"]  - realised_h3)^2,  na.rm=TRUE)), 4), "\n")
-cat("h=12:",  round(sqrt(mean((fc_rw[,"h12"] - realised_h12)^2, na.rm=TRUE)), 4), "\n")
+  idx12        <- max(1, t_now - 11)
+  fc_rw3[i, ] <- rep(mean(pi_core_mom[idx12:t_now], na.rm = TRUE), length(horizons))
+}
 
-# UCSV RMSE with same alignment
-cat("\nUCSV RMSE:\n")
-cat("h=1: ",  round(sqrt(mean((fc_ucsv[,"h1"]  - realised_h1)^2,  na.rm=TRUE)), 4), "\n")
-cat("h=3: ",  round(sqrt(mean((fc_ucsv[,"h3"]  - realised_h3)^2,  na.rm=TRUE)), 4), "\n")
-cat("h=12:",  round(sqrt(mean((fc_ucsv[,"h12"] - realised_h12)^2, na.rm=TRUE)), 4), "\n")
-
+saveRDS(fc_rw2, here("Output", "Forecasts", "fc_rw2_core.rds"))
+write.csv(fc_rw2, here("Output", "Forecasts", "fc_rw2_core.csv"))
+saveRDS(fc_rw3, here("Output", "Forecasts", "fc_rw3_core.rds"))
+write.csv(fc_rw3, here("Output", "Forecasts", "fc_rw3_core.csv"))
 
 # =============================================================================
-Visualizing
+# SECTION 6: RMSE BY HORIZON
 # =============================================================================
-# Compare the two series visually
-par(mfrow = c(2,1))
+# Realised at horizon h = average of pi_core_mom[t+1 : t+h]
+# This is the natural evaluation target consistent with path-average forecasts
 
-plot(dates, pi_core_mom, type = "l",
-     main = "Core HICP: month-on-month annualised (x1200)",
-     ylab = "%", xlab = "")
+compute_rmse_by_horizon <- function(fc_matrix, horizons, pi_mom, eval_start) {
+  rmse_vec <- numeric(length(horizons))
+  names(rmse_vec) <- paste0("h", horizons)
 
-plot(dates, pi_core_yoy, type = "l",
-     main = "Core HICP: year-on-year (x100)",
-     ylab = "%", xlab = "")
+  for (k in seq_along(horizons)) {
+    h         <- horizons[k]
+    n_fc      <- nrow(fc_matrix)
+    realised  <- numeric(n_fc)
 
-par(mfrow = c(1,1))
+    for (i in 1:n_fc) {
+      t_now       <- eval_start - 1 + i
+      future_vals <- pi_mom[(t_now + 1):(t_now + h)]
+      realised[i] <- mean(future_vals, na.rm = TRUE)
+    }
 
-# And check what the UCSV h=1 forecast actually represents
-cat("UCSV h=1 forecast range:", round(range(fc_ucsv[,"h1"]), 3), "\n")
-cat("MoM annualised range (eval period):",
-    round(range(pi_core_mom[eval_start:(eval_start+nrow(fc_ucsv)-1)], na.rm=TRUE), 3), "\n")
-cat("YoY range (eval period):",
-    round(range(pi_core_yoy[eval_start:(eval_start+nrow(fc_ucsv)-1)], na.rm=TRUE), 3), "\n")
+    errors       <- fc_matrix[, paste0("h", h)] - realised
+    rmse_vec[k]  <- sqrt(mean(errors^2, na.rm = TRUE))
+  }
+
+  rmse_vec
+}
+
+rmse_ucsv <- compute_rmse_by_horizon(fc_ucsv, horizons, pi_core_mom, eval_start)
+rmse_rw2  <- compute_rmse_by_horizon(fc_rw2,  horizons, pi_core_mom, eval_start)
+rmse_rw3  <- compute_rmse_by_horizon(fc_rw3,  horizons, pi_core_mom, eval_start)
+
+# Print results table
+cat("\nRMSE by horizon:\n")
+cat(sprintf("%-6s  %8s  %8s  %8s  %8s  %8s\n",
+            "h", "RW(3m)", "RW(12m)", "UCSV", "UCSV/RW2", "UCSV/RW3"))
+cat(strrep("-", 58), "\n")
+for (k in seq_along(horizons)) {
+  cat(sprintf("h=%-4s  %8.4f  %8.4f  %8.4f  %8.4f  %8.4f\n",
+              horizons[k],
+              rmse_rw2[k], rmse_rw3[k], rmse_ucsv[k],
+              rmse_ucsv[k] / rmse_rw2[k],
+              rmse_ucsv[k] / rmse_rw3[k]))
+}
+
+# Save RMSE table
+dir.create(here("Output", "Tables"), recursive = TRUE, showWarnings = FALSE)
+rmse_table <- data.frame(
+  horizon        = paste0("h", horizons),
+  rmse_rw2       = rmse_rw2,
+  rmse_rw3       = rmse_rw3,
+  rmse_ucsv      = rmse_ucsv,
+  ratio_ucsv_rw2 = rmse_ucsv / rmse_rw2,
+  ratio_ucsv_rw3 = rmse_ucsv / rmse_rw3
+)
+write.csv(rmse_table, here("Output", "Tables", "rmse_ucsv_rw.csv"), row.names = FALSE)
+
+# =============================================================================
+# SECTION 7: PLOTS
+# =============================================================================
+
+dir.create(here("Output", "Figures"), recursive = TRUE, showWarnings = FALSE)
+fc_ucsv  <- readRDS(here("Output", "Forecasts", "fc_ucsv_core.rds"))
+fc_rw2   <- readRDS(here("Output", "Forecasts", "fc_rw2_core.rds"))
+fc_rw3   <- readRDS(here("Output", "Forecasts", "fc_rw3_core.rds"))
+horizons <- c(1, 2, 3, 4, 5, 6, 12)
+
+ratio_rw2 <- rmse_ucsv / rmse_rw2
+ratio_rw3 <- rmse_ucsv / rmse_rw3
+
+# --- Plot 1: Absolute RMSE ---
+par(mfrow = c(1, 2))
+
+plot(horizons, rmse_ucsv,
+     type = "b", col = "blue", lwd = 2, pch = 16,
+     ylim = range(c(rmse_rw2, rmse_rw3, rmse_ucsv)) * c(0.9, 1.1),
+     xlab = "Forecast horizon (months)",
+     ylab = "RMSE (m/m annualised, %)",
+     main = "RMSE by horizon",
+     xaxt = "n")
+axis(1, at = horizons)
+lines(horizons, rmse_rw2, type = "b", col = "red",        lwd = 2, pch = 16, lty = 2)
+lines(horizons, rmse_rw3, type = "b", col = "darkorange", lwd = 2, pch = 16, lty = 3)
+legend("topright",
+       legend = c("UCSV", "RW (3m avg)", "RW (12m avg)"),
+       col    = c("blue", "red", "darkorange"),
+       lty    = c(1, 2, 3), lwd = 2, pch = 16, bty = "n")
+
+# --- Plot 2: Relative RMSE ---
+plot(horizons, ratio_rw2,
+     type = "b", col = "red", lwd = 2, pch = 16, lty = 2,
+     ylim = range(c(ratio_rw2, ratio_rw3)) * c(0.93, 1.05),
+     xlab = "Forecast horizon (months)",
+     ylab = "RMSE ratio (UCSV / benchmark)",
+     main = "Relative RMSE: UCSV vs benchmarks",
+     xaxt = "n")
+axis(1, at = horizons)
+lines(horizons, ratio_rw3, type = "b", col = "darkorange", lwd = 2, pch = 16, lty = 3)
+abline(h = 1, col = "grey40", lty = 2, lwd = 1.5)
+text(x = horizons, y = ratio_rw2,
+     labels = round(ratio_rw2, 2), pos = 3, cex = 0.7, col = "red")
+text(x = horizons, y = ratio_rw3,
+     labels = round(ratio_rw3, 2), pos = 1, cex = 0.7, col = "darkorange")
+legend("bottomleft",
+       legend = c("UCSV / RW (3m avg)", "UCSV / RW (12m avg)"),
+       col    = c("red", "darkorange"),
+       lty    = c(2, 3), lwd = 2, pch = 16, bty = "n")
+
+par(mfrow = c(1, 1))
+
+# --- Plot 3: h=1 forecasts vs realised ---
+fc_dates    <- dates[eval_start:(eval_start + n_origins - 1)]
+realised_h1 <- pi_core_mom[(eval_start + 1):(eval_start + n_origins)]
+
+plot(fc_dates, fc_ucsv[, "h1"],
+     type = "l", col = "blue", lwd = 1.5,
+     ylim = range(c(fc_ucsv[, "h1"], fc_rw2[, "h1"],
+                    fc_rw3[, "h1"], realised_h1), na.rm = TRUE),
+     main = "h=1 forecasts vs realised (m/m annualised)",
+     ylab = "% (annualised)", xlab = "")
+lines(fc_dates, fc_rw2[, "h1"], col = "red",        lwd = 1.2, lty = 2)
+lines(fc_dates, fc_rw3[, "h1"], col = "darkorange", lwd = 1.2, lty = 3)
+lines(fc_dates, realised_h1,    col = "grey40",     lwd = 1.5)
+legend("topleft",
+       legend = c("UCSV", "RW (3m avg)", "RW (12m avg)", "Realised"),
+       col    = c("blue", "red", "darkorange", "grey40"),
+       lty    = c(1, 2, 3, 1), lwd = 2, bty = "n")
+
+# --- Plot 4: h=12 forecasts vs realised ---
+realised_h12 <- numeric(n_origins)
+for (i in 1:n_origins) {
+  t_now           <- eval_start - 1 + i
+  realised_h12[i] <- mean(pi_core_mom[(t_now + 1):(t_now + 12)], na.rm = TRUE)
+}
+
+plot(fc_dates, fc_ucsv[, "h12"],
+     type = "l", col = "blue", lwd = 1.5,
+     ylim = range(c(fc_ucsv[, "h12"], fc_rw2[, "h12"],
+                    fc_rw3[, "h12"], realised_h12), na.rm = TRUE),
+     main = "h=12 forecasts vs realised (m/m annualised avg)",
+     ylab = "% (annualised)", xlab = "")
+lines(fc_dates, fc_rw2[, "h12"], col = "red",        lwd = 1.2, lty = 2)
+lines(fc_dates, fc_rw3[, "h12"], col = "darkorange", lwd = 1.2, lty = 3)
+lines(fc_dates, realised_h12,    col = "grey40",     lwd = 1.5)
+legend("topleft",
+       legend = c("UCSV", "RW (3m avg)", "RW (12m avg)", "Realised"),
+       col    = c("blue", "red", "darkorange", "grey40"),
+       lty    = c(1, 2, 3, 1), lwd = 2, bty = "n")
+ 
+
+
